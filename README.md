@@ -1,8 +1,6 @@
 # Enhanced Roman Order Block
 
 Advanced Order Block indicator for TradingView with mitigation options, higher timeframe confirmation, size filtering, alerts, and more.
-<img width="1675" height="823" alt="image" src="https://github.com/user-attachments/assets/7a79e30f-386f-4d7a-a962-419035029031" />
-
 
 ## Features
 - Bullish & Bearish OB detection
