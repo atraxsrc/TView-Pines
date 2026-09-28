@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-//  Roman 4-Phase  ::  H12 (720) bias  ->  H1 execution          (rev 2)
+//  Roman Trade Setup  ::  H12 (720) bias  ->  H1 execution          (rev 2)
 //  Phase 1: HTF bias via Market Structure Break (12H)
 //  Phase 2: 50% fib of the swing that created the bias
 //  Phase 3: HTF SFP (only when aligned with bias) + HTF Order Block / Breaker
@@ -19,7 +19,7 @@
 //   - Defaults match the "Alts" profile in the settings reference.
 //   - Guard against HTF <= chart timeframe.
 // =============================================================================
-indicator("Roman 4-Phase (H12 to H1)", "4-Phase", overlay = true,
+indicator("Roman Trade Setup (H12 to H1)", "Roman Setup", overlay = true,
      max_boxes_count = 50, max_labels_count = 50, max_lines_count = 50)
 
 // ============================= INPUTS ========================================
@@ -440,7 +440,7 @@ var table tb = table.new(tblPos, 2, 7, bgcolor = cTblBg,
      frame_color = color.new(color.gray, 50), frame_width = 1)
 
 if showTable and barstate.islast
-    table.cell(tb, 0, 0, "Roman 4-Phase", text_color = cTblTx, text_size = tblSize, text_halign = text.align_left,  bgcolor = color.new(color.gray, 75))
+    table.cell(tb, 0, 0, "Roman Trade Setup", text_color = cTblTx, text_size = tblSize, text_halign = text.align_left,  bgcolor = color.new(color.gray, 75))
     table.cell(tb, 1, 0, htfTf + " -> " + timeframe.period, text_color = cTblTx, text_size = tblSize, text_halign = text.align_right, bgcolor = color.new(color.gray, 75))
     table.cell(tb, 0, 1, "Bias",          text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
     table.cell(tb, 1, 1, biasTxt,         text_color = biasCol, text_size = tblSize, text_halign = text.align_right)

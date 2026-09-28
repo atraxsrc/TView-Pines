@@ -80,44 +80,44 @@ line_down = color.new(#fab387, 0)    // Solid peach for lines
 
 // Create new order blocks
 if bullishOB and showBullishOB and valid_size and htf_bull_confirm
-    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low, 
+    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low,
          border_color=line_up, border_width=1, bgcolor=color_up)
-    label.new(bar_index - (lookback-1), bullishY, "OB", color=label_up_bg, textcolor=label_text, 
+    label.new(bar_index - (lookback-1), bullishY, "OB", color=label_up_bg, textcolor=label_text,
          style=label.style_label_up, size=size.small)
     array.push(ob_boxes, box_id)
     array.push(ob_types, "bull")
     array.push(ob_prices, candleB_high)
     array.push(ob_starts, bar_index - (lookback-1))
     array.push(ob_mitigated, false)
-    
+
     // Draw lines if enabled
     if drawLines
         line_top = line.new(bar_index - (lookback-1), candleB_high, bar_index + extendBars, candleB_high, color=line_up, style=line.style_dashed)
         line_bottom = line.new(bar_index - (lookback-1), candleB_low, bar_index + extendBars, candleB_low, color=line_up, style=line.style_dashed)
         array.push(ob_lines_top, line_top)
         array.push(ob_lines_bottom, line_bottom)
-    
+
     if alertOnFormation
         alert("Bullish Order Block Formed at " + str.tostring(candleB_low), alert.freq_once_per_bar_close)
 
 if bearishOB and showBearishOB and valid_size and htf_bear_confirm
-    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low, 
+    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low,
          border_color=line_down, border_width=1, bgcolor=color_down)
-    label.new(bar_index - (lookback-1), bearishY, "OB", color=label_down_bg, textcolor=label_text, 
+    label.new(bar_index - (lookback-1), bearishY, "OB", color=label_down_bg, textcolor=label_text,
          style=label.style_label_down, size=size.small)
     array.push(ob_boxes, box_id)
     array.push(ob_types, "bear")
     array.push(ob_prices, candleB_low)
     array.push(ob_starts, bar_index - (lookback-1))
     array.push(ob_mitigated, false)
-    
+
     // Draw lines if enabled
     if drawLines
         line_top = line.new(bar_index - (lookback-1), candleB_high, bar_index + extendBars, candleB_high, color=line_down, style=line.style_dashed)
         line_bottom = line.new(bar_index - (lookback-1), candleB_low, bar_index + extendBars, candleB_low, color=line_down, style=line.style_dashed)
         array.push(ob_lines_top, line_top)
         array.push(ob_lines_bottom, line_bottom)
-    
+
     if alertOnFormation
         alert("Bearish Order Block Formed at " + str.tostring(candleB_high), alert.freq_once_per_bar_close)
 
@@ -129,7 +129,7 @@ if array.size(ob_boxes) > 0
         price_level = array.get(ob_prices, i)
         start_bar = array.get(ob_starts, i)
         is_mitigated = array.get(ob_mitigated, i)
-        
+
         // Only check for mitigation after the OB formation
         if bar_index > start_bar
             // Check if order block is mitigated (New: Wick or Close option)
@@ -145,7 +145,7 @@ if array.size(ob_boxes) > 0
                         mitigated := true
                     else if mitigationType == "Close" and close >= price_level
                         mitigated := true
-                
+
                 if mitigated
                     // Update the box and lines to end at current bar
                     box.set_right(box_id, bar_index)
@@ -156,10 +156,10 @@ if array.size(ob_boxes) > 0
                         line.set_extend(array.get(ob_lines_top, i), extend.none)
                         line.set_extend(array.get(ob_lines_bottom, i), extend.none)
                     array.set(ob_mitigated, i, true)
-                    
+
                     if alertOnMitigation
                         alert(ob_type + " Order Block Mitigated at " + str.tostring(price_level), alert.freq_once_per_bar_close)
-                    
+
                     if not showMitigatedOB
                         box.delete(box_id)
                         if drawLines
