@@ -37,6 +37,4 @@ Includes zone management (age, distance and height filters), an info table and a
 For the Trade Setup, use a chart timeframe below the HTF (H1 recommended).
 
 ## Development
-Run `pre-commit run --all-files` before committing.
-
 MIT License
