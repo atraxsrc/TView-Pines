@@ -1,0 +1,465 @@
+//@version=6
+// =============================================================================
+//  Roman 4-Phase  ::  H12 (720) bias  ->  H1 execution          (rev 2)
+//  Phase 1: HTF bias via Market Structure Break (12H)
+//  Phase 2: 50% fib of the swing that created the bias
+//  Phase 3: HTF SFP (only when aligned with bias) + HTF Order Block / Breaker
+//  Phase 4: H1 MSS (single clean label)
+//  Design goal: simple `var box` slots, strict zone hygiene, no arrays/UDTs.
+//
+//  rev 2 changes
+//   - HTF data: confirmed mode now uses expr[1] + lookahead_on, so history and
+//     realtime fire on the SAME chart bar (first bar of the next HTF candle).
+//   - Live (unconfirmed) mode: events are edge-detected, no duplicate zones.
+//   - Slot rotation no longer destroys a live slot-2 zone when slot 1 is empty.
+//   - Duplicate OB (same candle as newest zone) is skipped.
+//   - SFP ignores levels that were already closed through.
+//   - SFP label drawn on the actual HTF sweep candle and wick.
+//   - Zone invalidation and H1 MSS act on closed chart bars only.
+//   - Defaults match the "Alts" profile in the settings reference.
+//   - Guard against HTF <= chart timeframe.
+// =============================================================================
+indicator("Roman 4-Phase (H12 to H1)", "4-Phase", overlay = true,
+     max_boxes_count = 50, max_labels_count = 50, max_lines_count = 50)
+
+// ============================= INPUTS ========================================
+var string gH = "1 | HTF (bias engine)"
+htfTf      = input.timeframe("720", "HTF timeframe",                group = gH)
+htfPivot   = input.int(3,  "HTF pivot length", minval = 1, maxval = 20, group = gH)
+confirmHtf = input.bool(true, "Act only on CLOSED HTF bars (no repaint)", group = gH)
+
+var string gL = "2 | LTF (execution)"
+ltfPivot   = input.int(3, "H1 pivot length", minval = 1, maxval = 20, group = gL)
+ltfAlign   = input.bool(true, "H1 MSS must align with HTF bias",     group = gL)
+
+var string gZ = "3 | Zone management (strict)"
+ageUnitIn  = input.string("HTF bars", "Zone age counted in", options = ["HTF bars", "Chart bars"], group = gZ,
+     tooltip = "HTF bars is the sane default. 20 chart bars on a 1H chart is under two 12H candles, which culls zones almost immediately.")
+maxAge     = input.int(12,  "Max zone age",                   minval = 1,   group = gZ)
+maxDist    = input.float(10.0, "Max distance from price (%)   0 = off", minval = 0.0, step = 0.5, group = gZ,
+     tooltip = "Measured to the nearest edge of the zone, not the midpoint. Alts ~10, BTC/ETH ~5.")
+keepNewest = input.bool(true, "Always keep newest zone per direction", group = gZ,
+     tooltip = "Exempts the most recent zone from the age and distance filters. It is still removed when structurally invalidated.")
+maxHeight  = input.float(3.5, "Max zone height (%)          0 = off", minval = 0.0, step = 0.5, group = gZ,
+     tooltip = "Rejects order blocks taller than this. Alts ~3.5, BTC/ETH ~2.0 (with candle body on).")
+hideOpp    = input.bool(false, "Delete opposing zones on bias flip", group = gZ)
+maxPerSide = input.int(2,   "Max zones per direction",        minval = 1, maxval = 2, group = gZ)
+extendBars = input.int(10,  "Extend zones right (bars)",      minval = 0,   group = gZ)
+useBody    = input.bool(true, "Use candle body for Order Block", group = gZ)
+
+var string gV = "4 | Visuals"
+showZones  = input.bool(true, "Show zones",         group = gV)
+showFib    = input.bool(true, "Show 50% fib",       group = gV)
+showSfp    = input.bool(true, "Show HTF SFP label", group = gV)
+showMss    = input.bool(true, "Show H1 MSS label",  group = gV)
+showHtfMk  = input.bool(true, "Mark HTF MSS events (diagnostic)", group = gV,
+     tooltip = "Shows every HTF bias flip even if its zone was later culled, so you can tell a quiet engine from an aggressive filter.")
+showTable  = input.bool(true, "Show info table",    group = gV)
+tblPosIn   = input.string("Top right", "Table position", options = ["Top right", "Top left", "Bottom right", "Bottom left"], group = gV)
+tblSizeIn  = input.string("Normal", "Table text size", options = ["Small", "Normal", "Large", "Huge"], group = gV)
+
+var string gC = "5 | Colors"
+cObBullBd  = input.color(color.new(#26A69A, 0),  "Bull OB border",        group = gC)
+cObBullBg  = input.color(color.new(#26A69A, 85), "Bull OB fill",          group = gC)
+cObBearBd  = input.color(color.new(#EF5350, 0),  "Bear OB border",        group = gC)
+cObBearBg  = input.color(color.new(#EF5350, 85), "Bear OB fill",          group = gC)
+cBrBullBd  = input.color(color.new(#2962FF, 0),  "Bull breaker border",   group = gC)
+cBrBullBg  = input.color(color.new(#2962FF, 88), "Bull breaker fill",     group = gC)
+cBrBearBd  = input.color(color.new(#FF9800, 0),  "Bear breaker border",   group = gC)
+cBrBearBg  = input.color(color.new(#FF9800, 88), "Bear breaker fill",     group = gC)
+cFib       = input.color(color.new(#B39DDB, 0),  "50% fib line",          group = gC)
+cUp        = input.color(color.new(#26A69A, 0),  "Bullish text/label",    group = gC)
+cDn        = input.color(color.new(#EF5350, 0),  "Bearish text/label",    group = gC)
+cTblBg     = input.color(color.new(#1E222D, 10), "Table background",      group = gC)
+cTblTx     = input.color(color.new(#D1D4DC, 0),  "Table text",            group = gC)
+
+if barstate.isfirst and timeframe.in_seconds(htfTf) <= timeframe.in_seconds(timeframe.period)
+    runtime.error("HTF timeframe must be higher than the chart timeframe.")
+
+barMs = timeframe.in_seconds(timeframe.period) * 1000
+
+tblSize = switch tblSizeIn
+    "Small" => size.small
+    "Large" => size.large
+    "Huge"  => size.huge
+    => size.normal
+
+// ============================= HTF ENGINE ====================================
+// Everything structural is computed once, inside the HTF context.
+// `off` = 1 returns the previous (closed) HTF bar's values; used together
+// with lookahead_on this is the standard non-repainting pattern.
+f_htf(int off) =>
+    var float swHi   = na      // last confirmed HTF swing high
+    var float swLo   = na      // last confirmed HTF swing low
+    var bool  hiDone = true    // swing already broken? (prevents signal spam)
+    var bool  loDone = true
+    var float obTop  = na      // order block of the LAST bias event
+    var float obBot  = na
+    var int   obTm   = na
+    var float fib50  = na
+    var float bearT  = na      // last bearish HTF candle (source for bull OB)
+    var float bearB  = na
+    var int   bearTm = na
+    var float bullT  = na      // last bullish HTF candle (source for bear OB)
+    var float bullB  = na
+    var int   bullTm = na
+
+    ph = ta.pivothigh(high, htfPivot, htfPivot)
+    pl = ta.pivotlow(low,  htfPivot, htfPivot)
+
+    if not na(ph)
+        swHi   := ph
+        hiDone := false
+    if not na(pl)
+        swLo   := pl
+        loDone := false
+
+    // SFP = sweep of a still-intact swing + close back inside.
+    // Evaluated before the MSS flags are updated, so a level that was already
+    // closed through on an earlier bar can't produce a fake "reclaim" SFP.
+    bullSfp = not na(swLo) and not loDone and low  < swLo and close > swLo
+    bearSfp = not na(swHi) and not hiDone and high > swHi and close < swHi
+
+    bullMss = not na(swHi) and not hiDone and close > swHi
+    bearMss = not na(swLo) and not loDone and close < swLo
+
+    if bullMss
+        hiDone := true
+        fib50  := na(swLo) ? na : (swHi + swLo) / 2.0
+        obTop  := bearT
+        obBot  := bearB
+        obTm   := bearTm
+    if bearMss
+        loDone := true
+        fib50  := na(swHi) or na(swLo) ? na : (swHi + swLo) / 2.0
+        obTop  := bullT
+        obBot  := bullB
+        obTm   := bullTm
+
+    // update candle memory LAST, so a break uses the candle *before* it
+    if close < open
+        bearT  := useBody ? open : high
+        bearB  := useBody ? close : low
+        bearTm := time
+    if close > open
+        bullT  := useBody ? close : high
+        bullB  := useBody ? open : low
+        bullTm := time
+
+    [bullMss[off], bearMss[off], obTop[off], obBot[off], obTm[off], fib50[off],
+     bullSfp[off], bearSfp[off], high[off], low[off], time[off]]
+
+htfOff  = confirmHtf ? 1 : 0
+htfLook = confirmHtf ? barmerge.lookahead_on : barmerge.lookahead_off
+
+[rBull, rBear, obT, obB, obTm, fibRaw, rSfpB, rSfpS, rHtfHi, rHtfLo, rTime] =
+     request.security(syminfo.tickerid, htfTf, f_htf(htfOff), lookahead = htfLook)
+
+// A new HTF value has arrived. In confirmed mode this is the first chart bar of
+// each new HTF candle, identically on history and realtime.
+htfNew = not na(rTime) and not na(rTime[1]) and rTime != rTime[1]
+
+// HTF bar counter, used as the default age clock for zones
+var int htfBarNo = 0
+if htfNew
+    htfBarNo += 1
+
+nowUnit = ageUnitIn == "HTF bars" ? htfBarNo : bar_index
+
+// Edge-detected events: fire once per HTF event, never on every chart bar
+// that happens to see the same HTF value.
+evBull  = rBull and (htfNew or not rBull[1])
+evBear  = rBear and (htfNew or not rBear[1])
+evSfpB  = rSfpB and (htfNew or not rSfpB[1])
+evSfpS  = rSfpS and (htfNew or not rSfpS[1])
+
+// ============================= BIAS + FIB ====================================
+var int   bias    = 0
+var float fib50   = na
+var int   lastEvB = na
+var label sfpLbl  = na
+var int   sfpBar  = na
+var int   sfpDir  = 0
+
+if evBull
+    bias    := 1
+    fib50   := fibRaw
+    lastEvB := bar_index
+    if sfpDir == -1          // stale SFP from the old regime, drop it
+        sfpBar := na
+        sfpDir := 0
+if evBear
+    bias    := -1
+    fib50   := fibRaw
+    lastEvB := bar_index
+    if sfpDir == 1
+        sfpBar := na
+        sfpDir := 0
+
+fibPlot = showFib and not (evBull or evBear) ? fib50 : na
+plot(fibPlot, "HTF 50% Fib", color = cFib, style = plot.style_linebr, linewidth = 1, display = display.pane)
+
+plotshape(showHtfMk and evBull, "HTF MSS up",   shape.triangleup,   location.belowbar, cUp, size = size.tiny, display = display.pane)
+plotshape(showHtfMk and evBear, "HTF MSS down", shape.triangledown, location.abovebar, cDn, size = size.tiny, display = display.pane)
+
+// ============================= ZONE SLOTS ====================================
+// Simple, flat, boring state. Two slots per direction, nothing else.
+// Slot 1 is always the newest.
+var box   bBox1 = na
+var float bTop1 = na
+var float bBot1 = na
+var int   bAge1 = na
+var bool  bBrk1 = false
+
+var box   bBox2 = na
+var float bTop2 = na
+var float bBot2 = na
+var int   bAge2 = na
+var bool  bBrk2 = false
+
+var box   sBox1 = na
+var float sTop1 = na
+var float sBot1 = na
+var int   sAge1 = na
+var bool  sBrk1 = false
+
+var box   sBox2 = na
+var float sTop2 = na
+var float sBot2 = na
+var int   sAge2 = na
+var bool  sBrk2 = false
+
+// distance from price to the nearest edge of a zone, in %
+zDist(float t, float b) =>
+    close > t ? (close - t) / close * 100.0 : close < b ? (b - close) / close * 100.0 : 0.0
+
+// Per-bar housekeeping for one slot: age filter, distance filter,
+// OB -> breaker conversion, breaker invalidation, right-edge extension.
+// Structural changes only happen on a closed chart bar (no intrabar flicker).
+mgZone(box bx, float t, float b, int created, bool brk, bool isBull, bool newest) =>
+    box  rb = bx
+    bool rk = brk
+    if not na(rb)
+        age     = nowUnit - created
+        dist    = zDist(t, b)
+        exempt  = newest and keepNewest
+        tooOld  = not exempt and age > maxAge
+        tooFar  = not exempt and maxDist > 0.0 and dist > maxDist
+        conf    = barstate.isconfirmed
+        broke   = conf and (isBull ? close < b : close > t)   // OB failed -> breaker
+        dead    = conf and (isBull ? close > t : close < b)   // breaker failed -> remove
+        if tooOld or tooFar
+            box.delete(rb)
+            rb := na
+        else
+            if not rk and broke
+                rk := true
+                box.set_bgcolor(rb,      isBull ? cBrBearBg : cBrBullBg)
+                box.set_border_color(rb, isBull ? cBrBearBd : cBrBullBd)
+            else if rk and dead
+                box.delete(rb)
+                rb := na
+            if not na(rb)
+                box.set_right(rb, time + barMs * extendBars)
+    [rb, rk]
+
+[nb1, nk1] = mgZone(bBox1, bTop1, bBot1, bAge1, bBrk1, true, true)
+bBox1 := nb1
+bBrk1 := nk1
+[nb2, nk2] = mgZone(bBox2, bTop2, bBot2, bAge2, bBrk2, true, false)
+bBox2 := nb2
+bBrk2 := nk2
+[ns1, nl1] = mgZone(sBox1, sTop1, sBot1, sAge1, sBrk1, false, true)
+sBox1 := ns1
+sBrk1 := nl1
+[ns2, nl2] = mgZone(sBox2, sTop2, sBot2, sAge2, sBrk2, false, false)
+sBox2 := ns2
+sBrk2 := nl2
+
+// ---- create new zones on confirmed bias events ----
+zoneH = not na(obT) and not na(obB) ? (obT - obB) / close * 100.0 : na
+okOb  = showZones and not na(obT) and not na(obB) and not na(obTm) and obT > obB and
+     (maxHeight <= 0.0 or zoneH <= maxHeight)
+
+// two breaks in a row with no opposite candle between them point at the same OB
+dupBull = not na(bBox1) and obT == bTop1 and obB == bBot1
+dupBear = not na(sBox1) and obT == sTop1 and obB == sBot1
+
+if evBull and hideOpp
+    if not na(sBox1)
+        box.delete(sBox1)
+        sBox1 := na
+    if not na(sBox2)
+        box.delete(sBox2)
+        sBox2 := na
+
+if evBull and okOb and not dupBull
+    if maxPerSide == 1 or na(bBox1)
+        // slot 1 is free (or we only keep one): overwrite slot 1, leave slot 2 alone
+        if not na(bBox1)
+            box.delete(bBox1)
+    else
+        if not na(bBox2)
+            box.delete(bBox2)
+        bBox2 := bBox1
+        bTop2 := bTop1
+        bBot2 := bBot1
+        bAge2 := bAge1
+        bBrk2 := bBrk1
+    bBox1 := box.new(obTm, obT, time + barMs * extendBars, obB, xloc = xloc.bar_time,
+             border_color = cObBullBd, bgcolor = cObBullBg, border_width = 1)
+    bTop1 := obT
+    bBot1 := obB
+    bAge1 := nowUnit
+    bBrk1 := false
+
+if evBear and hideOpp
+    if not na(bBox1)
+        box.delete(bBox1)
+        bBox1 := na
+    if not na(bBox2)
+        box.delete(bBox2)
+        bBox2 := na
+
+if evBear and okOb and not dupBear
+    if maxPerSide == 1 or na(sBox1)
+        if not na(sBox1)
+            box.delete(sBox1)
+    else
+        if not na(sBox2)
+            box.delete(sBox2)
+        sBox2 := sBox1
+        sTop2 := sTop1
+        sBot2 := sBot1
+        sAge2 := sAge1
+        sBrk2 := sBrk1
+    sBox1 := box.new(obTm, obT, time + barMs * extendBars, obB, xloc = xloc.bar_time,
+             border_color = cObBearBd, bgcolor = cObBearBg, border_width = 1)
+    sTop1 := obT
+    sBot1 := obB
+    sAge1 := nowUnit
+    sBrk1 := false
+
+// ============================= HTF SFP (bias aligned only) ===================
+sfpBull = evSfpB and bias ==  1
+sfpBear = evSfpS and bias == -1
+
+if showSfp and (sfpBull or sfpBear)
+    if not na(sfpLbl)
+        label.delete(sfpLbl)
+    // drawn on the HTF candle that did the sweep, at its wick
+    sfpLbl := label.new(rTime, sfpBull ? rHtfLo : rHtfHi, "SFP", xloc = xloc.bar_time,
+         style     = sfpBull ? label.style_label_up : label.style_label_down,
+         color     = color.new(sfpBull ? cUp : cDn, 20),
+         textcolor = color.white, size = size.tiny)
+if sfpBull or sfpBear
+    sfpBar := bar_index
+    sfpDir := sfpBull ? 1 : -1
+
+// ============================= H1 MSS (one clean label) ======================
+var float lHi     = na
+var float lLo     = na
+var bool  lHiDone = true
+var bool  lLoDone = true
+
+lph = ta.pivothigh(high, ltfPivot, ltfPivot)
+lpl = ta.pivotlow(low,  ltfPivot, ltfPivot)
+
+if not na(lph)
+    lHi     := lph
+    lHiDone := false
+if not na(lpl)
+    lLo     := lpl
+    lLoDone := false
+
+// closed chart bars only: no intrabar labels or alerts that later vanish
+rawMssUp = barstate.isconfirmed and not na(lHi) and not lHiDone and close > lHi
+rawMssDn = barstate.isconfirmed and not na(lLo) and not lLoDone and close < lLo
+if rawMssUp
+    lHiDone := true
+if rawMssDn
+    lLoDone := true
+
+mssUp = rawMssUp and (not ltfAlign or bias ==  1)
+mssDn = rawMssDn and (not ltfAlign or bias == -1)
+
+var label mssLbl = na
+if showMss and (mssUp or mssDn)
+    if not na(mssLbl)
+        label.delete(mssLbl)
+    mssLbl := label.new(bar_index, mssUp ? low : high, "MSS",
+         style     = mssUp ? label.style_label_up : label.style_label_down,
+         color     = color.new(mssUp ? cUp : cDn, 55),
+         textcolor = cTblTx, size = size.tiny)
+
+// ============================= INFO TABLE ====================================
+tblPos = switch tblPosIn
+    "Top left"     => position.top_left
+    "Bottom right" => position.bottom_right
+    "Bottom left"  => position.bottom_left
+    => position.top_right
+
+// nearest live zone (used for the "Active zone" row)
+float nD = na
+string nN = "None"
+if not na(bBox1)
+    d = zDist(bTop1, bBot1)
+    if na(nD) or d < nD
+        nD := d
+        nN := bBrk1 ? "Bear Breaker" : "Bull OB"
+if not na(bBox2)
+    d = zDist(bTop2, bBot2)
+    if na(nD) or d < nD
+        nD := d
+        nN := bBrk2 ? "Bear Breaker" : "Bull OB"
+if not na(sBox1)
+    d = zDist(sTop1, sBot1)
+    if na(nD) or d < nD
+        nD := d
+        nN := sBrk1 ? "Bull Breaker" : "Bear OB"
+if not na(sBox2)
+    d = zDist(sTop2, sBot2)
+    if na(nD) or d < nD
+        nD := d
+        nN := sBrk2 ? "Bull Breaker" : "Bear OB"
+
+nBull = (na(bBox1) ? 0 : 1) + (na(bBox2) ? 0 : 1)
+nBear = (na(sBox1) ? 0 : 1) + (na(sBox2) ? 0 : 1)
+
+biasTxt = bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Neutral"
+biasCol = bias == 1 ? cUp : bias == -1 ? cDn : color.gray
+sfpTxt  = na(sfpBar) ? "None" : (sfpDir == 1 ? "Bullish" : "Bearish") + "  " + str.tostring(bar_index - sfpBar) + " bars ago"
+sfpCol  = na(sfpBar) ? color.gray : (sfpDir == 1 ? cUp : cDn)
+zoneTxt = na(nD) ? "None" : nD <= 0.0 ? nN + "   inside" : nN + "   " + str.tostring(nD, "#.##") + "%"
+zoneCol = na(nD) ? color.gray : cTblTx
+fibTxt  = na(fib50) ? "n/a" : str.tostring(fib50, format.mintick) + "   " + (close > fib50 ? "above" : "below")
+evTxt   = na(lastEvB) ? "None yet" : str.tostring(bar_index - lastEvB) + " bars ago"
+
+var table tb = table.new(tblPos, 2, 7, bgcolor = cTblBg,
+     border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+if showTable and barstate.islast
+    table.cell(tb, 0, 0, "Roman 4-Phase", text_color = cTblTx, text_size = tblSize, text_halign = text.align_left,  bgcolor = color.new(color.gray, 75))
+    table.cell(tb, 1, 0, htfTf + " -> " + timeframe.period, text_color = cTblTx, text_size = tblSize, text_halign = text.align_right, bgcolor = color.new(color.gray, 75))
+    table.cell(tb, 0, 1, "Bias",          text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 1, biasTxt,         text_color = biasCol, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 2, "SFP",           text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 2, sfpTxt,          text_color = sfpCol, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 3, "Active zone",   text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 3, zoneTxt,         text_color = zoneCol, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 4, "50% Fib",       text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 4, fibTxt,          text_color = cFib, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 5, "Zones B / S",   text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 5, str.tostring(nBull) + " / " + str.tostring(nBear), text_color = cTblTx, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 6, "Last HTF MSS",  text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 6, evTxt,           text_color = cTblTx, text_size = tblSize, text_halign = text.align_right)
+
+// ============================= ALERTS ========================================
+// Create alerts with "Once Per Bar Close" for consistent behaviour.
+alertcondition(evBull,  "HTF bias -> Bullish", "HTF MSS up: bias is now bullish")
+alertcondition(evBear,  "HTF bias -> Bearish", "HTF MSS down: bias is now bearish")
+alertcondition(sfpBull, "HTF Bullish SFP",     "Bias-aligned bullish SFP on HTF")
+alertcondition(sfpBear, "HTF Bearish SFP",     "Bias-aligned bearish SFP on HTF")
+alertcondition(mssUp,   "H1 MSS up",           "H1 MSS up, aligned with HTF bias")
+alertcondition(mssDn,   "H1 MSS down",         "H1 MSS down, aligned with HTF bias")
