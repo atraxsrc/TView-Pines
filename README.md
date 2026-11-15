@@ -31,6 +31,8 @@ Includes zone management (age, distance and height filters), an info table and a
 
 ## Settings guide
 
+Both scripts can draw this guide on the chart, with your current values in brackets: tick `Show settings guide on chart` in the `Guide` group at the bottom of the Inputs tab.
+
 ### Enhanced Roman Order Block
 
 | You want | Change |

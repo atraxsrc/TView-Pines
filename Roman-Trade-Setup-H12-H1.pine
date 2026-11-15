@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-//  Roman Trade Setup  ::  H12 (720) bias  ->  H1 execution          (rev 4)
+//  Roman Trade Setup  ::  H12 (720) bias  ->  H1 execution          (rev 5)
 //  Phase 1: HTF bias via Market Structure Break (12H)
 //  Phase 2: 50% fib of the swing that created the bias
 //  Phase 3: HTF SFP (only when aligned with bias) + HTF Order Block / Breaker
@@ -39,6 +39,10 @@
 //     stale breaker no longer rides along as "the newest" of its old side.
 //   - Zones beyond the max distance are hidden, not deleted, and come back when
 //     price returns. Only age and structure remove a zone.
+//
+//  rev 5 changes
+//   - Optional settings guide drawn on the chart ("Guide" group, last in the
+//     Inputs tab).
 // =============================================================================
 indicator("Roman Trade Setup (H12 to H1)", "Roman Setup", overlay = true,
      max_boxes_count = 50, max_labels_count = 50, max_lines_count = 50)
@@ -637,3 +641,52 @@ alertcondition(sfpBull, "HTF Bullish SFP",     "{{ticker}}: bias-aligned bullish
 alertcondition(sfpBear, "HTF Bearish SFP",     "{{ticker}}: bias-aligned bearish SFP on HTF")
 alertcondition(mssUp,   "LTF MSS up",          "{{ticker}} {{interval}}: MSS up (passed bias and setup filters)")
 alertcondition(mssDn,   "LTF MSS down",        "{{ticker}} {{interval}}: MSS down (passed bias and setup filters)")
+
+// ============================= SETTINGS GUIDE ================================
+// A cheat sheet drawn on the chart: "if you want X, change Y", with the values
+// you have right now. These inputs are declared last on purpose, so settings
+// already saved on a chart keep their place when the script is updated.
+var string gG = "Guide"
+showGuide  = input.bool(false, "Show settings guide on chart", group = gG,
+     tooltip = "Draws a cheat sheet on the chart: what to change for a given goal, with your current values in brackets. Untick to hide it.")
+guidePosIn = input.string("Bottom right", "Guide position", options = ["Top left", "Top right", "Middle left", "Middle right", "Bottom left", "Bottom right"], group = gG)
+guideSzIn  = input.string("Small", "Guide text size", options = ["Tiny", "Small", "Normal", "Large"], group = gG)
+
+guidePos = switch guidePosIn
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    "Middle left"  => position.middle_left
+    "Middle right" => position.middle_right
+    "Bottom left"  => position.bottom_left
+    => position.bottom_right
+guideSz = switch guideSzIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+var table guide = table.new(guidePos, 2, 12, bgcolor = cTblBg,
+     border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+gRow(int r, string want, string change) =>
+    table.cell(guide, 0, r, want,   text_color = cTblTx, text_size = guideSz, text_halign = text.align_left)
+    table.cell(guide, 1, r, change, text_color = cTblTx, text_size = guideSz, text_halign = text.align_left)
+
+gOn(bool b) =>
+    b ? "ticked" : "unticked"
+
+if showGuide and barstate.islast
+    table.cell(guide, 0, 0, "Roman Setup: if you want...", text_color = cTblTx, text_size = guideSz, text_halign = text.align_left, bgcolor = color.new(color.gray, 75))
+    table.cell(guide, 1, 0, "...change this  [current value]", text_color = cTblTx, text_size = guideSz, text_halign = text.align_left, bgcolor = color.new(color.gray, 75))
+    gRow(1,  "Alt coin profile",             "'Max distance from price' 10, 'Max zone height' 3.5  [" + str.tostring(maxDist) + ", " + str.tostring(maxHeight) + "]")
+    gRow(2,  "BTC / ETH profile",            "'Max distance from price' 5, 'Max zone height' 2")
+    gRow(3,  "Fewer bias flips",             "Raise 'HTF pivot length' to 4 or 5  [" + str.tostring(htfPivot) + "]")
+    gRow(4,  "Zones removed too soon",       "Raise 'Max zone age'  [" + str.tostring(maxAge) + "], keep 'Always keep newest zone' ticked  [" + gOn(keepNewest) + "]")
+    gRow(5,  "Far zones shown sooner",       "Raise 'Max distance from price'. Hidden zones return on their own when price comes back")
+    gRow(6,  "Fewer zones",                  "'Max zones per direction' = 1  [" + str.tostring(maxPerSide) + "], tick 'Delete opposing zones on bias flip'  [" + gOn(hideOpp) + "]")
+    gRow(7,  "Only the best entries",        "'LTF MSS also requires' = Zone tap or SFP  [" + mssGate + "], then tune 'Setup window'  [" + str.tostring(gateWin) + "]")
+    gRow(8,  "More / fewer MSS labels",      "Lower / raise 'LTF pivot length'  [" + str.tostring(ltfPivot) + "]")
+    gRow(9,  "Signals before the HTF close", "Untick 'Act only on CLOSED HTF bars'. This repaints  [" + gOn(confirmHtf) + "]")
+    gRow(10, "HTF alerts with no delay",     "Alert trigger 'Once Per Bar' while CLOSED HTF bars is ticked, otherwise 'Once Per Bar Close'")
+    gRow(11, "Read the info table",          "'MSS filter' shows Long / Short armed when a setup is ready. '+N hidden' = zones parked out of range")

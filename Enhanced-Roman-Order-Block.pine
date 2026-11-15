@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-//  Enhanced Roman Order Block                                        (rev 2)
+//  Enhanced Roman Order Block                                        (rev 3)
 //
 //  Pattern (bullish, bearish is the mirror):
 //    A  candle before the OB
@@ -22,6 +22,10 @@
 //   - Object limits raised to 500, Max OBs and extension inputs are capped.
 //   - Max OBs evicts mitigated blocks first, then the oldest.
 //   - One HTF request instead of three, colors are inputs.
+//
+//  rev 3 changes
+//   - Optional settings guide drawn on the chart ("Guide" group, last in the
+//     Inputs tab).
 // =============================================================================
 indicator("Enhanced Roman Order Block", "Enhanced OB", overlay = true,
      max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
@@ -169,3 +173,51 @@ while obs.size() > maxOBs
             break
     OrderBlock gone = obs.remove(idx)
     gone.wipe()
+
+// ============================= SETTINGS GUIDE ================================
+// A cheat sheet drawn on the chart: "if you want X, change Y", with the values
+// you have right now. These inputs are declared last on purpose, so settings
+// already saved on a chart keep their place when the script is updated.
+var string gG = "Guide"
+showGuide  = input.bool(false, "Show settings guide on chart", group = gG,
+     tooltip = "Draws a cheat sheet on the chart: what to change for a given goal, with your current values in brackets. Untick to hide it.")
+guidePosIn = input.string("Bottom left", "Guide position", options = ["Top left", "Top right", "Middle left", "Middle right", "Bottom left", "Bottom right"], group = gG)
+guideSzIn  = input.string("Small", "Guide text size", options = ["Tiny", "Small", "Normal", "Large"], group = gG)
+
+guidePos = switch guidePosIn
+    "Top left"     => position.top_left
+    "Top right"    => position.top_right
+    "Middle left"  => position.middle_left
+    "Middle right" => position.middle_right
+    "Bottom right" => position.bottom_right
+    => position.bottom_left
+guideSz = switch guideSzIn
+    "Tiny"   => size.tiny
+    "Normal" => size.normal
+    "Large"  => size.large
+    => size.small
+
+color cGuideBg = color.new(#1E222D, 10)
+color cGuideTx = #D1D4DC
+color cGuideHd = color.new(color.gray, 75)
+
+var table guide = table.new(guidePos, 2, 10, bgcolor = cGuideBg,
+     border_color = color.new(color.gray, 60), border_width = 1,
+     frame_color = color.new(color.gray, 50), frame_width = 1)
+
+gRow(int r, string want, string change) =>
+    table.cell(guide, 0, r, want,   text_color = cGuideTx, text_size = guideSz, text_halign = text.align_left)
+    table.cell(guide, 1, r, change, text_color = cGuideTx, text_size = guideSz, text_halign = text.align_left)
+
+if showGuide and barstate.islast
+    table.cell(guide, 0, 0, "Enhanced OB: if you want...", text_color = cGuideTx, text_size = guideSz, text_halign = text.align_left, bgcolor = cGuideHd)
+    table.cell(guide, 1, 0, "...change this  [current value]", text_color = cGuideTx, text_size = guideSz, text_halign = text.align_left, bgcolor = cGuideHd)
+    gRow(1, "Fewer, stronger blocks",        "Raise 'Min OB Size (ATR Multiple)' toward 1.0  [" + str.tostring(minOBSizeATR) + "]")
+    gRow(2, "More blocks",                   "Lower 'Min OB Size', raise 'Lookback Candles'  [" + str.tostring(lookback) + "]")
+    gRow(3, "Blocks that survive a wick",    "'Mitigation Type' = Close  [" + mitigationType + "]")
+    gRow(4, "Used blocks removed",           "Untick 'Show Mitigated Order Blocks'  [" + (showMitigatedOB ? "ticked" : "unticked") + "]")
+    gRow(5, "Shorter live boxes",            "Lower 'Box Extension Bars', try 50  [" + str.tostring(extendBars) + "]")
+    gRow(6, "Less line clutter",             "Untick 'Draw Price Lines from OBs'  [" + (drawLines ? "ticked" : "unticked") + "]")
+    gRow(7, "Fewer blocks on screen",        "Lower 'Max OBs to Show'  [" + str.tostring(maxOBs) + "]")
+    gRow(8, "Only blocks that swept an HTF high/low", "Set 'Higher Timeframe for Confirmation', e.g. 4h on a 15m chart  [" + (useHTF ? htf : "off") + "]")
+    gRow(9, "Alerts",                        "Tick the two alert inputs, then create an alert with 'Any alert() function call'")
