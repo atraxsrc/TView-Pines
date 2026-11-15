@@ -1,191 +1,171 @@
-//@version=5
-indicator("Enhanced Roman Order Block", overlay=true, shorttitle="Enhanced OB")
+//@version=6
+// =============================================================================
+//  Enhanced Roman Order Block                                        (rev 2)
+//
+//  Pattern (bullish, bearish is the mirror):
+//    A  candle before the OB
+//    B  the OB candle: makes a lower low than A
+//    C  candle after B: holds a higher low than B
+//    X  first candle whose low clears B's high (the displacement)
+//  The OB is drawn on the bar where X closes, and is "mitigated" when price
+//  comes back to B's high.
+//
+//  rev 2 changes
+//   - Pine v6, one OrderBlock object per zone instead of 7 parallel arrays.
+//   - Labels are owned by their OB and deleted with it (no orphan labels).
+//   - Unmitigated boxes and lines keep extending with the chart.
+//   - Lookback now means "bars allowed for the displacement", and every bar in
+//     that window is checked. Lookback 3 finds the same OBs as before.
+//   - OBs form on closed bars only (no intrabar flicker).
+//   - An OB is created on the bar that clears it, so it can no longer be
+//     mitigated on its own creation bar.
+//   - Object limits raised to 500, Max OBs and extension inputs are capped.
+//   - Max OBs evicts mitigated blocks first, then the oldest.
+//   - One HTF request instead of three, colors are inputs.
+// =============================================================================
+indicator("Enhanced Roman Order Block", "Enhanced OB", overlay = true,
+     max_boxes_count = 500, max_lines_count = 500, max_labels_count = 500)
 
-// Input options for toggling order blocks
-showBullishOB = input.bool(true, title="Show Bullish Order Blocks", group="Order Block Settings")
-showBearishOB = input.bool(true, title="Show Bearish Order Blocks", group="Order Block Settings")
-showMitigatedOB = input.bool(true, title="Show Mitigated Order Blocks", group="Order Block Settings")
-mitigationType = input.string("Wick", title="Mitigation Type", options=["Wick", "Close"], group="Order Block Settings")  // New: Wick or Close-based mitigation
-minOBSizeATR = input.float(0.5, title="Min OB Size (ATR Multiple)", minval=0.0, group="Order Block Settings")  // New: Filter small OBs
-lookback = input.int(3, title="Lookback Candles", minval=2, group="Order Block Settings")  // New: Adjustable lookback
-extendBars = input.int(499, title="Box Extension Bars", minval=0, group="Display Settings")  // New: Customizable extension
-drawLines = input.bool(true, title="Draw Price Lines from OBs", group="Display Settings")  // New: Option to draw lines
-maxOBs = input.int(20, title="Max OBs to Show", minval=1, group="Display Settings")  // New: Limit number of OBs
-alertOnFormation = input.bool(false, title="Alert on OB Formation", group="Alerts")  // New: Alerts
-alertOnMitigation = input.bool(false, title="Alert on OB Mitigation", group="Alerts")
+// ============================= INPUTS ========================================
+var string gO = "Order Block Settings"
+showBullishOB   = input.bool(true, "Show Bullish Order Blocks",   group = gO)
+showBearishOB   = input.bool(true, "Show Bearish Order Blocks",   group = gO)
+showMitigatedOB = input.bool(true, "Show Mitigated Order Blocks", group = gO,
+     tooltip = "Off = a block is removed from the chart the moment it is mitigated.")
+mitigationType  = input.string("Wick", "Mitigation Type", options = ["Wick", "Close"], group = gO,
+     tooltip = "Wick = any touch of the block's near edge. Close = a bar must close at or beyond it (stricter, blocks live longer).")
+minOBSizeATR    = input.float(0.5, "Min OB Size (ATR Multiple)", minval = 0.0, step = 0.1, group = gO,
+     tooltip = "Ignores OB candles smaller than this multiple of ATR(14). Raise it to keep only big candles, 0 = no filter.")
+lookback        = input.int(3, "Lookback Candles", minval = 2, maxval = 10, group = gO,
+     tooltip = "How many bars price gets to clear the OB candle. 2 = only an immediate gap, 3 = classic pattern, higher = slower displacements also count (more blocks).")
 
-// Higher Timeframe Option (New)
-htf = input.timeframe("", title="Higher Timeframe for Confirmation", group="Multi-Timeframe")  // Empty for no HTF
+var string gD = "Display Settings"
+extendBars = input.int(499, "Box Extension Bars", minval = 0, maxval = 499, group = gD,
+     tooltip = "How far an unmitigated block reaches past the current bar. TradingView allows at most 500 bars into the future.")
+drawLines  = input.bool(true, "Draw Price Lines from OBs", group = gD)
+maxOBs     = input.int(20, "Max OBs to Show", minval = 1, maxval = 200, group = gD,
+     tooltip = "When the limit is hit, mitigated blocks are dropped first, then the oldest.")
+cBull      = input.color(#89b4fa,     "Bullish color", group = gD)
+cBear      = input.color(#fab387,     "Bearish color", group = gD)
+cLabelTx   = input.color(color.white, "Label text",    group = gD)
+
+var string gA = "Alerts"
+alertOnFormation  = input.bool(false, "Alert on OB Formation",  group = gA)
+alertOnMitigation = input.bool(false, "Alert on OB Mitigation", group = gA)
+
+var string gM = "Multi-Timeframe"
+htf = input.timeframe("", "Higher Timeframe for Confirmation", group = gM,
+     tooltip = "Empty = off. When set, a bullish OB candle must trade at or below the previous HTF candle's low (a sweep of HTF liquidity), a bearish one at or above its high.")
 useHTF = htf != ""
 
-// Runtime check: Ensure HTF is actually higher than chart timeframe
 if useHTF and timeframe.in_seconds(htf) <= timeframe.in_seconds()
     runtime.error("Higher Timeframe must be greater than the chart's timeframe.")
 
-// Fetch HTF data if enabled (with offset for confirmed values, no lookahead bias)
-htf_high = request.security(syminfo.tickerid, htf, high[1], lookahead=barmerge.lookahead_on)
-htf_low = request.security(syminfo.tickerid, htf, low[1], lookahead=barmerge.lookahead_on)
-htf_close = request.security(syminfo.tickerid, htf, close[1], lookahead=barmerge.lookahead_on)
+// Previous CLOSED HTF candle. [1] + lookahead_on is the non-repainting pattern.
+[htfHigh, htfLow] = request.security(syminfo.tickerid, htf, [high[1], low[1]], lookahead = barmerge.lookahead_on)
 
-// Store order blocks in arrays
-var ob_boxes = array.new_box()
-var ob_lines_top = array.new_line()  // New: For top lines
-var ob_lines_bottom = array.new_line()  // New: For bottom lines
-var ob_types = array.new_string()  // "bull" or "bear"
-var ob_prices = array.new_float()  // Store the mitigation price level
-var ob_starts = array.new_int()    // Store the start bar_index for each OB
-var ob_mitigated = array.new_bool()  // Track if OB is mitigated
+// ============================= STATE =========================================
+type OrderBlock
+    box   bx
+    line  top
+    line  bot
+    label lb
+    bool  isBull
+    float level                // price that mitigates the block
+    bool  mitigated = false
 
-// Dynamic candle references based on lookback
-candleA_high = high[lookback]
-candleA_low  = low[lookback]
-candleB_high = high[lookback-1]
-candleB_low  = low[lookback-1]
-candleC_high = high[lookback-2]
-candleC_low  = low[lookback-2]
-candleD_high = high[0]
-candleD_low  = low[0]
+var array<OrderBlock> obs = array.new<OrderBlock>()
 
-// Bullish Order Block Criteria (adjusted for lookback)
-bullishOB = (candleB_low < candleA_low) and (candleC_low > candleB_low) and ((candleC_low > candleB_high) or (candleD_low > candleB_high))
+method wipe(OrderBlock this) =>
+    box.delete(this.bx)
+    line.delete(this.top)
+    line.delete(this.bot)
+    label.delete(this.lb)
 
-// Bearish Order Block Criteria (adjusted for lookback)
-bearishOB = (candleB_high > candleA_high) and (candleC_high < candleB_high) and ((candleC_high < candleB_low) or (candleD_high < candleB_low))
-
-// Calculate OB size and filter
-ob_height = candleB_high - candleB_low
-atr_val = ta.atr(14)
-min_size = atr_val * minOBSizeATR
-valid_size = ob_height >= min_size
-
-// HTF Confirmation (New: Optional check if price respects HTF levels)
-htf_bull_confirm = not useHTF or (candleB_low <= htf_low[lookback-1])
-htf_bear_confirm = not useHTF or (candleB_high >= htf_high[lookback-1])
-
-// Offset for label placement
-offsetAmount = atr_val * 0.1
-
-// Define Y-coordinates for labels
-bullishY = candleB_low - offsetAmount
-bearishY = candleB_high + offsetAmount
-
-// Define custom colors from Catppuccin Mocha
-color_up = color.new(#89b4fa, 90)    // Blue for bullish, with transparency
-color_down = color.new(#fab387, 90)  // Peach for bearish, with transparency
-label_up_bg = #89b4fa                // Solid for label background
-label_down_bg = #fab387              // Solid for label background
-label_text = color.white             // White text for labels
-line_up = color.new(#89b4fa, 0)      // Solid blue for lines
-line_down = color.new(#fab387, 0)    // Solid peach for lines
-
-// Create new order blocks
-if bullishOB and showBullishOB and valid_size and htf_bull_confirm
-    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low,
-         border_color=line_up, border_width=1, bgcolor=color_up)
-    label.new(bar_index - (lookback-1), bullishY, "OB", color=label_up_bg, textcolor=label_text,
-         style=label.style_label_up, size=size.small)
-    array.push(ob_boxes, box_id)
-    array.push(ob_types, "bull")
-    array.push(ob_prices, candleB_high)
-    array.push(ob_starts, bar_index - (lookback-1))
-    array.push(ob_mitigated, false)
-
-    // Draw lines if enabled
+f_newOB(bool isBull, int left, float top, float bot, float gap) =>
+    color c = isBull ? cBull : cBear
+    int right = bar_index + extendBars
+    OrderBlock o = OrderBlock.new()
+    o.isBull := isBull
+    o.level  := isBull ? top : bot
+    o.bx     := box.new(left, top, right, bot, border_color = c, border_width = 1, bgcolor = color.new(c, 90))
+    o.lb     := label.new(left, isBull ? bot - gap : top + gap, "OB", color = c, textcolor = cLabelTx,
+         style = isBull ? label.style_label_up : label.style_label_down, size = size.small)
     if drawLines
-        line_top = line.new(bar_index - (lookback-1), candleB_high, bar_index + extendBars, candleB_high, color=line_up, style=line.style_dashed)
-        line_bottom = line.new(bar_index - (lookback-1), candleB_low, bar_index + extendBars, candleB_low, color=line_up, style=line.style_dashed)
-        array.push(ob_lines_top, line_top)
-        array.push(ob_lines_bottom, line_bottom)
+        o.top := line.new(left, top, right, top, color = c, style = line.style_dashed)
+        o.bot := line.new(left, bot, right, bot, color = c, style = line.style_dashed)
+    o
 
-    if alertOnFormation
-        alert("Bullish Order Block Formed at " + str.tostring(candleB_low), alert.freq_once_per_bar_close)
+atrVal  = ta.atr(14)
+minSize = atrVal * minOBSizeATR
+pad     = atrVal * 0.1
 
-if bearishOB and showBearishOB and valid_size and htf_bear_confirm
-    box_id = box.new(left=bar_index - (lookback-1), right=bar_index + extendBars, top=candleB_high, bottom=candleB_low,
-         border_color=line_down, border_width=1, bgcolor=color_down)
-    label.new(bar_index - (lookback-1), bearishY, "OB", color=label_down_bg, textcolor=label_text,
-         style=label.style_label_down, size=size.small)
-    array.push(ob_boxes, box_id)
-    array.push(ob_types, "bear")
-    array.push(ob_prices, candleB_low)
-    array.push(ob_starts, bar_index - (lookback-1))
-    array.push(ob_mitigated, false)
+// ============================= MANAGE EXISTING BLOCKS ========================
+// Runs before detection, so a block is never tested on its own creation bar.
+if obs.size() > 0
+    for i = obs.size() - 1 to 0
+        OrderBlock o = obs.get(i)
+        if not o.mitigated
+            bool hit = false
+            if mitigationType == "Wick"
+                hit := o.isBull ? low <= o.level : high >= o.level
+            else
+                hit := barstate.isconfirmed and (o.isBull ? close <= o.level : close >= o.level)
 
-    // Draw lines if enabled
-    if drawLines
-        line_top = line.new(bar_index - (lookback-1), candleB_high, bar_index + extendBars, candleB_high, color=line_down, style=line.style_dashed)
-        line_bottom = line.new(bar_index - (lookback-1), candleB_low, bar_index + extendBars, candleB_low, color=line_down, style=line.style_dashed)
-        array.push(ob_lines_top, line_top)
-        array.push(ob_lines_bottom, line_bottom)
+            if hit
+                o.mitigated := true
+                box.set_right(o.bx, bar_index)
+                line.set_x2(o.top, bar_index)
+                line.set_x2(o.bot, bar_index)
+                if alertOnMitigation
+                    alert((o.isBull ? "Bullish" : "Bearish") + " Order Block Mitigated at " + str.tostring(o.level, format.mintick),
+                         alert.freq_once_per_bar_close)
+                if not showMitigatedOB
+                    o.wipe()
+                    obs.remove(i)
+            else
+                // still live: keep it reaching past the current bar
+                box.set_right(o.bx, bar_index + extendBars)
+                line.set_x2(o.top, bar_index + extendBars)
+                line.set_x2(o.bot, bar_index + extendBars)
 
-    if alertOnFormation
-        alert("Bearish Order Block Formed at " + str.tostring(candleB_high), alert.freq_once_per_bar_close)
+// ============================= DETECT NEW BLOCKS =============================
+// k = how many bars back the OB candle (B) sits. The current bar is the one
+// that clears it, and no earlier bar may have cleared it already, so every OB
+// candle is reported exactly once.
+if barstate.isconfirmed
+    for k = 1 to lookback - 1
+        float bH = high[k]
+        float bL = low[k]
+        if bH - bL >= minSize
+            bool bull = showBullishOB and bL < low[k + 1]  and low[k - 1]  > bL and low  > bH
+            bool bear = showBearishOB and bH > high[k + 1] and high[k - 1] < bH and high < bL
 
-// Check for mitigation of existing order blocks
-if array.size(ob_boxes) > 0
-    for i = array.size(ob_boxes) - 1 to 0
-        box_id = array.get(ob_boxes, i)
-        ob_type = array.get(ob_types, i)
-        price_level = array.get(ob_prices, i)
-        start_bar = array.get(ob_starts, i)
-        is_mitigated = array.get(ob_mitigated, i)
+            if (bull or bear) and k > 1
+                for j = 1 to k - 1
+                    if low[j] > bH
+                        bull := false
+                    if high[j] < bL
+                        bear := false
 
-        // Only check for mitigation after the OB formation
-        if bar_index > start_bar
-            // Check if order block is mitigated (New: Wick or Close option)
-            if not is_mitigated
-                mitigated = false
-                if ob_type == "bull"
-                    if mitigationType == "Wick" and low <= price_level
-                        mitigated := true
-                    else if mitigationType == "Close" and close <= price_level
-                        mitigated := true
-                if ob_type == "bear"
-                    if mitigationType == "Wick" and high >= price_level
-                        mitigated := true
-                    else if mitigationType == "Close" and close >= price_level
-                        mitigated := true
+            if bull and (not useHTF or bL <= htfLow[k])
+                obs.push(f_newOB(true, bar_index - k, bH, bL, pad))
+                if alertOnFormation
+                    alert("Bullish Order Block Formed at " + str.tostring(bL, format.mintick), alert.freq_once_per_bar_close)
 
-                if mitigated
-                    // Update the box and lines to end at current bar
-                    box.set_right(box_id, bar_index)
-                    box.set_extend(box_id, extend.none)
-                    if drawLines
-                        line.set_x2(array.get(ob_lines_top, i), bar_index)
-                        line.set_x2(array.get(ob_lines_bottom, i), bar_index)
-                        line.set_extend(array.get(ob_lines_top, i), extend.none)
-                        line.set_extend(array.get(ob_lines_bottom, i), extend.none)
-                    array.set(ob_mitigated, i, true)
+            if bear and (not useHTF or bH >= htfHigh[k])
+                obs.push(f_newOB(false, bar_index - k, bH, bL, pad))
+                if alertOnFormation
+                    alert("Bearish Order Block Formed at " + str.tostring(bH, format.mintick), alert.freq_once_per_bar_close)
 
-                    if alertOnMitigation
-                        alert(ob_type + " Order Block Mitigated at " + str.tostring(price_level), alert.freq_once_per_bar_close)
-
-                    if not showMitigatedOB
-                        box.delete(box_id)
-                        if drawLines
-                            line.delete(array.get(ob_lines_top, i))
-                            line.delete(array.get(ob_lines_bottom, i))
-                            array.remove(ob_lines_top, i)
-                            array.remove(ob_lines_bottom, i)
-                        // Remove the OB from tracking arrays
-                        array.remove(ob_boxes, i)
-                        array.remove(ob_types, i)
-                        array.remove(ob_prices, i)
-                        array.remove(ob_starts, i)
-                        array.remove(ob_mitigated, i)
-
-// Limit the number of OBs (New: Cleanup old ones if exceeding max)
-if array.size(ob_boxes) > maxOBs
-    for i = 0 to array.size(ob_boxes) - maxOBs - 1
-        box.delete(array.get(ob_boxes, i))
-        if drawLines
-            line.delete(array.get(ob_lines_top, i))
-            line.delete(array.get(ob_lines_bottom, i))
-        array.remove(ob_boxes, i)
-        array.remove(ob_types, i)
-        array.remove(ob_prices, i)
-        array.remove(ob_starts, i)
-        array.remove(ob_mitigated, i)
-        if drawLines
-            array.remove(ob_lines_top, i)
-            array.remove(ob_lines_bottom, i)
+// ============================= ENFORCE MAX ===================================
+// Drop the oldest mitigated block first. Only when none is mitigated does the
+// oldest live block go.
+while obs.size() > maxOBs
+    int idx = 0
+    for [j, o] in obs
+        if o.mitigated
+            idx := j
+            break
+    OrderBlock gone = obs.remove(idx)
+    gone.wipe()

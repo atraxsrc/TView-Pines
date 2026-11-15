@@ -1,6 +1,6 @@
 //@version=6
 // =============================================================================
-//  Roman Trade Setup  ::  H12 (720) bias  ->  H1 execution          (rev 2)
+//  Roman Trade Setup  ::  H12 (720) bias  ->  H1 execution          (rev 4)
 //  Phase 1: HTF bias via Market Structure Break (12H)
 //  Phase 2: 50% fib of the swing that created the bias
 //  Phase 3: HTF SFP (only when aligned with bias) + HTF Order Block / Breaker
@@ -18,6 +18,27 @@
 //   - Zone invalidation and H1 MSS act on closed chart bars only.
 //   - Defaults match the "Alts" profile in the settings reference.
 //   - Guard against HTF <= chart timeframe.
+//
+//  rev 3 changes
+//   - 50% fib is anchored to the true origin of the breaking leg (the extreme
+//     since the broken swing formed), not the last confirmed pivot, which can
+//     be stale when the break comes fast.
+//   - "Delete opposing zones on bias flip" goes by a zone's effective
+//     direction: a breaker counts as the side it now acts for.
+//   - When the newest zone dies, the older one takes its place and inherits the
+//     "always keep newest" exemption.
+//   - Optional LTF MSS filter: require a recent zone tap and/or HTF SFP.
+//   - Age and distance culls act on closed chart bars only.
+//   - Stale SFP label is removed on a bias flip.
+//   - Table zone count goes by effective direction, table math runs on the
+//     last bar only.
+//   - Labels and alerts say LTF, since the chart timeframe is not fixed to H1.
+//
+//  rev 4 changes
+//   - "Always keep newest zone" picks the newest zone per EFFECTIVE side, so a
+//     stale breaker no longer rides along as "the newest" of its old side.
+//   - Zones beyond the max distance are hidden, not deleted, and come back when
+//     price returns. Only age and structure remove a zone.
 // =============================================================================
 indicator("Roman Trade Setup (H12 to H1)", "Roman Setup", overlay = true,
      max_boxes_count = 50, max_labels_count = 50, max_lines_count = 50)
@@ -29,17 +50,21 @@ htfPivot   = input.int(3,  "HTF pivot length", minval = 1, maxval = 20, group = 
 confirmHtf = input.bool(true, "Act only on CLOSED HTF bars (no repaint)", group = gH)
 
 var string gL = "2 | LTF (execution)"
-ltfPivot   = input.int(3, "H1 pivot length", minval = 1, maxval = 20, group = gL)
-ltfAlign   = input.bool(true, "H1 MSS must align with HTF bias",     group = gL)
+ltfPivot   = input.int(3, "LTF pivot length", minval = 1, maxval = 20, group = gL)
+ltfAlign   = input.bool(true, "LTF MSS must align with HTF bias",    group = gL)
+mssGate    = input.string("None", "LTF MSS also requires", options = ["None", "Zone tap or SFP", "Zone tap", "SFP"], group = gL,
+     tooltip = "None = every aligned MSS is shown. The other options only show an MSS when price recently traded into a same-direction zone and/or printed a bias-aligned HTF SFP. Zone tap needs 'Show zones' on.")
+gateWin    = input.int(24, "Setup window (chart bars)", minval = 1, group = gL,
+     tooltip = "How recent the zone tap or SFP must be for the MSS filter. 24 bars on H1 is two 12H candles.")
 
 var string gZ = "3 | Zone management (strict)"
 ageUnitIn  = input.string("HTF bars", "Zone age counted in", options = ["HTF bars", "Chart bars"], group = gZ,
      tooltip = "HTF bars is the sane default. 20 chart bars on a 1H chart is under two 12H candles, which culls zones almost immediately.")
 maxAge     = input.int(12,  "Max zone age",                   minval = 1,   group = gZ)
 maxDist    = input.float(10.0, "Max distance from price (%)   0 = off", minval = 0.0, step = 0.5, group = gZ,
-     tooltip = "Measured to the nearest edge of the zone, not the midpoint. Alts ~10, BTC/ETH ~5.")
+     tooltip = "Zones farther than this are hidden and come back when price returns within range. Measured to the nearest edge of the zone, not the midpoint. Alts ~10, BTC/ETH ~5.")
 keepNewest = input.bool(true, "Always keep newest zone per direction", group = gZ,
-     tooltip = "Exempts the most recent zone from the age and distance filters. It is still removed when structurally invalidated.")
+     tooltip = "Exempts the most recent bullish-acting and the most recent bearish-acting zone from the age and distance filters (a breaker counts for the side it now acts for). Still removed when structurally invalidated.")
 maxHeight  = input.float(3.5, "Max zone height (%)          0 = off", minval = 0.0, step = 0.5, group = gZ,
      tooltip = "Rejects order blocks taller than this. Alts ~3.5, BTC/ETH ~2.0 (with candle body on).")
 hideOpp    = input.bool(false, "Delete opposing zones on bias flip", group = gZ)
@@ -51,7 +76,7 @@ var string gV = "4 | Visuals"
 showZones  = input.bool(true, "Show zones",         group = gV)
 showFib    = input.bool(true, "Show 50% fib",       group = gV)
 showSfp    = input.bool(true, "Show HTF SFP label", group = gV)
-showMss    = input.bool(true, "Show H1 MSS label",  group = gV)
+showMss    = input.bool(true, "Show LTF MSS label", group = gV)
 showHtfMk  = input.bool(true, "Mark HTF MSS events (diagnostic)", group = gV,
      tooltip = "Shows every HTF bias flip even if its zone was later culled, so you can tell a quiet engine from an aggressive filter.")
 showTable  = input.bool(true, "Show info table",    group = gV)
@@ -103,16 +128,26 @@ f_htf(int off) =>
     var float bullT  = na      // last bullish HTF candle (source for bear OB)
     var float bullB  = na
     var int   bullTm = na
+    var float loLeg  = na      // lowest low since swHi formed  (origin of a bull break)
+    var float hiLeg  = na      // highest high since swLo formed (origin of a bear break)
 
-    ph = ta.pivothigh(high, htfPivot, htfPivot)
-    pl = ta.pivotlow(low,  htfPivot, htfPivot)
+    ph  = ta.pivothigh(high, htfPivot, htfPivot)
+    pl  = ta.pivotlow(low,  htfPivot, htfPivot)
+    loN = ta.lowest(low,   htfPivot)   // the bars after a just-confirmed pivot
+    hiN = ta.highest(high, htfPivot)
 
     if not na(ph)
         swHi   := ph
         hiDone := false
+        loLeg  := loN
+    else if not na(swHi)
+        loLeg  := na(loLeg) ? low : math.min(loLeg, low)
     if not na(pl)
         swLo   := pl
         loDone := false
+        hiLeg  := hiN
+    else if not na(swLo)
+        hiLeg  := na(hiLeg) ? high : math.max(hiLeg, high)
 
     // SFP = sweep of a still-intact swing + close back inside.
     // Evaluated before the MSS flags are updated, so a level that was already
@@ -123,15 +158,17 @@ f_htf(int off) =>
     bullMss = not na(swHi) and not hiDone and close > swHi
     bearMss = not na(swLo) and not loDone and close < swLo
 
+    // 50% of the leg that did the breaking: from its true origin (the extreme
+    // since the broken swing formed) to the broken level.
     if bullMss
         hiDone := true
-        fib50  := na(swLo) ? na : (swHi + swLo) / 2.0
+        fib50  := na(loLeg) ? na : (swHi + loLeg) / 2.0
         obTop  := bearT
         obBot  := bearB
         obTm   := bearTm
     if bearMss
         loDone := true
-        fib50  := na(swHi) or na(swLo) ? na : (swHi + swLo) / 2.0
+        fib50  := na(hiLeg) ? na : (swLo + hiLeg) / 2.0
         obTop  := bullT
         obBot  := bullB
         obTm   := bullTm
@@ -185,7 +222,9 @@ if evBull
     bias    := 1
     fib50   := fibRaw
     lastEvB := bar_index
-    if sfpDir == -1          // stale SFP from the old regime, drop it
+    if sfpDir == -1          // stale SFP from the old regime, drop it and its label
+        label.delete(sfpLbl)
+        sfpLbl := na
         sfpBar := na
         sfpDir := 0
 if evBear
@@ -193,6 +232,8 @@ if evBear
     fib50   := fibRaw
     lastEvB := bar_index
     if sfpDir == 1
+        label.delete(sfpLbl)
+        sfpLbl := na
         sfpBar := na
         sfpDir := 0
 
@@ -229,52 +270,134 @@ var float sBot2 = na
 var int   sAge2 = na
 var bool  sBrk2 = false
 
-// distance from price to the nearest edge of a zone, in %
-zDist(float t, float b) =>
-    close > t ? (close - t) / close * 100.0 : close < b ? (b - close) / close * 100.0 : 0.0
+// distance from a price to the nearest edge of a zone, in %
+zDistAt(float px, float t, float b) =>
+    px > t ? (px - t) / px * 100.0 : px < b ? (b - px) / px * 100.0 : 0.0
 
-// Per-bar housekeeping for one slot: age filter, distance filter,
-// OB -> breaker conversion, breaker invalidation, right-edge extension.
-// Structural changes only happen on a closed chart bar (no intrabar flicker).
-mgZone(box bx, float t, float b, int created, bool brk, bool isBull, bool newest) =>
+zDist(float t, float b) =>
+    zDistAt(close, t, b)
+
+// Visibility is decided from the last CLOSED chart bar, so nothing flickers
+// while the realtime bar is still moving.
+refPx = barstate.isconfirmed ? close : nz(close[1], close)
+
+// Step 1, structure (closed chart bars only):
+// OB closed through -> breaker, breaker closed through -> removed.
+zStruct(box bx, float t, float b, bool brk, bool isBull) =>
     box  rb = bx
     bool rk = brk
+    if not na(rb) and barstate.isconfirmed
+        if not rk
+            if (isBull ? close < b : close > t)
+                rk := true
+        else if (isBull ? close > t : close < b)
+            box.delete(rb)
+            rb := na
+    [rb, rk]
+
+// Step 2, filters and drawing: too old -> removed, too far -> hidden (comes
+// back when price returns), then colors and right-edge extension.
+zShow(box bx, float t, float b, int created, bool brk, bool isBull, bool exempt) =>
+    box  rb  = bx
+    bool far = false
     if not na(rb)
-        age     = nowUnit - created
-        dist    = zDist(t, b)
-        exempt  = newest and keepNewest
-        tooOld  = not exempt and age > maxAge
-        tooFar  = not exempt and maxDist > 0.0 and dist > maxDist
-        conf    = barstate.isconfirmed
-        broke   = conf and (isBull ? close < b : close > t)   // OB failed -> breaker
-        dead    = conf and (isBull ? close > t : close < b)   // breaker failed -> remove
-        if tooOld or tooFar
+        if barstate.isconfirmed and not exempt and nowUnit - created > maxAge
             box.delete(rb)
             rb := na
         else
-            if not rk and broke
-                rk := true
-                box.set_bgcolor(rb,      isBull ? cBrBearBg : cBrBullBg)
-                box.set_border_color(rb, isBull ? cBrBearBd : cBrBullBd)
-            else if rk and dead
-                box.delete(rb)
-                rb := na
-            if not na(rb)
-                box.set_right(rb, time + barMs * extendBars)
-    [rb, rk]
+            far := not exempt and maxDist > 0.0 and zDistAt(refPx, t, b) > maxDist
+            bool  up = isBull != brk      // side the zone acts for right now
+            color bg = brk ? (up ? cBrBullBg : cBrBearBg) : (up ? cObBullBg : cObBearBg)
+            color bd = brk ? (up ? cBrBullBd : cBrBearBd) : (up ? cObBullBd : cObBearBd)
+            box.set_bgcolor(rb,      far ? color.new(bg, 100) : bg)
+            box.set_border_color(rb, far ? color.new(bd, 100) : bd)
+            box.set_right(rb, time + barMs * extendBars)
+    [rb, far]
 
-[nb1, nk1] = mgZone(bBox1, bTop1, bBot1, bAge1, bBrk1, true, true)
+// newer of two creation stamps, ignoring slots that are not in play
+zNewer(int cur, int stamp, bool live) =>
+    live and (na(cur) or stamp > cur) ? stamp : cur
+
+// ---- step 1: structure ----
+[nb1, nk1] = zStruct(bBox1, bTop1, bBot1, bBrk1, true)
 bBox1 := nb1
 bBrk1 := nk1
-[nb2, nk2] = mgZone(bBox2, bTop2, bBot2, bAge2, bBrk2, true, false)
+[nb2, nk2] = zStruct(bBox2, bTop2, bBot2, bBrk2, true)
 bBox2 := nb2
 bBrk2 := nk2
-[ns1, nl1] = mgZone(sBox1, sTop1, sBot1, sAge1, sBrk1, false, true)
+[ns1, nl1] = zStruct(sBox1, sTop1, sBot1, sBrk1, false)
 sBox1 := ns1
 sBrk1 := nl1
-[ns2, nl2] = mgZone(sBox2, sTop2, sBot2, sAge2, sBrk2, false, false)
+[ns2, nl2] = zStruct(sBox2, sTop2, sBot2, sBrk2, false)
 sBox2 := ns2
 sBrk2 := nl2
+
+// ---- bias flip: drop zones that now act against the new bias ----
+// Effective direction, not slot: a bull OB that failed is a BEAR breaker, and a
+// bear OB that failed is a BULL breaker (which is exactly what a new bullish
+// bias wants to keep).
+if hideOpp and (evBull or evBear)
+    if not na(bBox1) and bBrk1 == evBull
+        box.delete(bBox1)
+        bBox1 := na
+    if not na(bBox2) and bBrk2 == evBull
+        box.delete(bBox2)
+        bBox2 := na
+    if not na(sBox1) and sBrk1 == evBear
+        box.delete(sBox1)
+        sBox1 := na
+    if not na(sBox2) and sBrk2 == evBear
+        box.delete(sBox2)
+        sBox2 := na
+
+// ---- keep slot 1 = newest: promote slot 2 when slot 1 is empty ----
+if na(bBox1) and not na(bBox2)
+    bBox1 := bBox2
+    bTop1 := bTop2
+    bBot1 := bBot2
+    bAge1 := bAge2
+    bBrk1 := bBrk2
+    bBox2 := na
+if na(sBox1) and not na(sBox2)
+    sBox1 := sBox2
+    sTop1 := sTop2
+    sBot1 := sBot2
+    sAge1 := sAge2
+    sBrk1 := sBrk2
+    sBox2 := na
+
+// ---- newest zone per EFFECTIVE side ----
+// A bull-slot zone acts bullish until it breaks, then bearish, and the reverse
+// for bear slots. The newest zone on each side is exempt from age and distance.
+int newUp = na
+int newDn = na
+newUp := zNewer(newUp, bAge1, not na(bBox1) and not bBrk1)
+newUp := zNewer(newUp, bAge2, not na(bBox2) and not bBrk2)
+newUp := zNewer(newUp, sAge1, not na(sBox1) and sBrk1)
+newUp := zNewer(newUp, sAge2, not na(sBox2) and sBrk2)
+newDn := zNewer(newDn, sAge1, not na(sBox1) and not sBrk1)
+newDn := zNewer(newDn, sAge2, not na(sBox2) and not sBrk2)
+newDn := zNewer(newDn, bAge1, not na(bBox1) and bBrk1)
+newDn := zNewer(newDn, bAge2, not na(bBox2) and bBrk2)
+
+bEx1 = keepNewest and bAge1 == (bBrk1 ? newDn : newUp)
+bEx2 = keepNewest and bAge2 == (bBrk2 ? newDn : newUp)
+sEx1 = keepNewest and sAge1 == (sBrk1 ? newUp : newDn)
+sEx2 = keepNewest and sAge2 == (sBrk2 ? newUp : newDn)
+
+// ---- step 2: filters and drawing ----
+[vb1, fb1] = zShow(bBox1, bTop1, bBot1, bAge1, bBrk1, true, bEx1)
+bBox1 := vb1
+bool bFar1 = fb1
+[vb2, fb2] = zShow(bBox2, bTop2, bBot2, bAge2, bBrk2, true, bEx2)
+bBox2 := vb2
+bool bFar2 = fb2
+[vs1, fs1] = zShow(sBox1, sTop1, sBot1, sAge1, sBrk1, false, sEx1)
+sBox1 := vs1
+bool sFar1 = fs1
+[vs2, fs2] = zShow(sBox2, sTop2, sBot2, sAge2, sBrk2, false, sEx2)
+sBox2 := vs2
+bool sFar2 = fs2
 
 // ---- create new zones on confirmed bias events ----
 zoneH = not na(obT) and not na(obB) ? (obT - obB) / close * 100.0 : na
@@ -284,14 +407,6 @@ okOb  = showZones and not na(obT) and not na(obB) and not na(obTm) and obT > obB
 // two breaks in a row with no opposite candle between them point at the same OB
 dupBull = not na(bBox1) and obT == bTop1 and obB == bBot1
 dupBear = not na(sBox1) and obT == sTop1 and obB == sBot1
-
-if evBull and hideOpp
-    if not na(sBox1)
-        box.delete(sBox1)
-        sBox1 := na
-    if not na(sBox2)
-        box.delete(sBox2)
-        sBox2 := na
 
 if evBull and okOb and not dupBull
     if maxPerSide == 1 or na(bBox1)
@@ -306,20 +421,14 @@ if evBull and okOb and not dupBull
         bBot2 := bBot1
         bAge2 := bAge1
         bBrk2 := bBrk1
+        bFar2 := bFar1
     bBox1 := box.new(obTm, obT, time + barMs * extendBars, obB, xloc = xloc.bar_time,
              border_color = cObBullBd, bgcolor = cObBullBg, border_width = 1)
     bTop1 := obT
     bBot1 := obB
     bAge1 := nowUnit
     bBrk1 := false
-
-if evBear and hideOpp
-    if not na(bBox1)
-        box.delete(bBox1)
-        bBox1 := na
-    if not na(bBox2)
-        box.delete(bBox2)
-        bBox2 := na
+    bFar1 := false
 
 if evBear and okOb and not dupBear
     if maxPerSide == 1 or na(sBox1)
@@ -333,12 +442,14 @@ if evBear and okOb and not dupBear
         sBot2 := sBot1
         sAge2 := sAge1
         sBrk2 := sBrk1
+        sFar2 := sFar1
     sBox1 := box.new(obTm, obT, time + barMs * extendBars, obB, xloc = xloc.bar_time,
              border_color = cObBearBd, bgcolor = cObBearBg, border_width = 1)
     sTop1 := obT
     sBot1 := obB
     sAge1 := nowUnit
     sBrk1 := false
+    sFar1 := false
 
 // ============================= HTF SFP (bias aligned only) ===================
 sfpBull = evSfpB and bias ==  1
@@ -356,7 +467,46 @@ if sfpBull or sfpBear
     sfpBar := bar_index
     sfpDir := sfpBull ? 1 : -1
 
-// ============================= H1 MSS (one clean label) ======================
+// ============================= ZONE TAPS =====================================
+// Last chart bar that traded into a zone, by the zone's effective direction:
+// a bull OB or bull breaker is support, a bear OB or bear breaker is resistance.
+zTouch(box bx, float t, float b) =>
+    not na(bx) and low <= t and high >= b
+
+var int tapUpBar = na
+var int tapDnBar = na
+
+bT1 = zTouch(bBox1, bTop1, bBot1)
+bT2 = zTouch(bBox2, bTop2, bBot2)
+sT1 = zTouch(sBox1, sTop1, sBot1)
+sT2 = zTouch(sBox2, sTop2, sBot2)
+
+if (bT1 and not bBrk1) or (bT2 and not bBrk2) or (sT1 and sBrk1) or (sT2 and sBrk2)
+    tapUpBar := bar_index
+if (sT1 and not sBrk1) or (sT2 and not sBrk2) or (bT1 and bBrk1) or (bT2 and bBrk2)
+    tapDnBar := bar_index
+
+// Optional filter for the LTF MSS: a recent zone tap and/or bias-aligned SFP.
+inWin(int b) =>
+    not na(b) and bar_index - b <= gateWin
+
+tapUp = inWin(tapUpBar)
+tapDn = inWin(tapDnBar)
+sfpUp = sfpDir ==  1 and inWin(sfpBar)
+sfpDn = sfpDir == -1 and inWin(sfpBar)
+
+gateUp = switch mssGate
+    "Zone tap or SFP" => tapUp or sfpUp
+    "Zone tap"        => tapUp
+    "SFP"             => sfpUp
+    => true
+gateDn = switch mssGate
+    "Zone tap or SFP" => tapDn or sfpDn
+    "Zone tap"        => tapDn
+    "SFP"             => sfpDn
+    => true
+
+// ============================= LTF MSS (one clean label) =====================
 var float lHi     = na
 var float lLo     = na
 var bool  lHiDone = true
@@ -380,8 +530,8 @@ if rawMssUp
 if rawMssDn
     lLoDone := true
 
-mssUp = rawMssUp and (not ltfAlign or bias ==  1)
-mssDn = rawMssDn and (not ltfAlign or bias == -1)
+mssUp = rawMssUp and (not ltfAlign or bias ==  1) and gateUp
+mssDn = rawMssDn and (not ltfAlign or bias == -1) and gateDn
 
 var label mssLbl = na
 if showMss and (mssUp or mssDn)
@@ -399,47 +549,65 @@ tblPos = switch tblPosIn
     "Bottom left"  => position.bottom_left
     => position.top_right
 
-// nearest live zone (used for the "Active zone" row)
-float nD = na
-string nN = "None"
-if not na(bBox1)
-    d = zDist(bTop1, bBot1)
-    if na(nD) or d < nD
-        nD := d
-        nN := bBrk1 ? "Bear Breaker" : "Bull OB"
-if not na(bBox2)
-    d = zDist(bTop2, bBot2)
-    if na(nD) or d < nD
-        nD := d
-        nN := bBrk2 ? "Bear Breaker" : "Bull OB"
-if not na(sBox1)
-    d = zDist(sTop1, sBot1)
-    if na(nD) or d < nD
-        nD := d
-        nN := sBrk1 ? "Bull Breaker" : "Bear OB"
-if not na(sBox2)
-    d = zDist(sTop2, sBot2)
-    if na(nD) or d < nD
-        nD := d
-        nN := sBrk2 ? "Bull Breaker" : "Bear OB"
-
-nBull = (na(bBox1) ? 0 : 1) + (na(bBox2) ? 0 : 1)
-nBear = (na(sBox1) ? 0 : 1) + (na(sBox2) ? 0 : 1)
-
-biasTxt = bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Neutral"
-biasCol = bias == 1 ? cUp : bias == -1 ? cDn : color.gray
-sfpTxt  = na(sfpBar) ? "None" : (sfpDir == 1 ? "Bullish" : "Bearish") + "  " + str.tostring(bar_index - sfpBar) + " bars ago"
-sfpCol  = na(sfpBar) ? color.gray : (sfpDir == 1 ? cUp : cDn)
-zoneTxt = na(nD) ? "None" : nD <= 0.0 ? nN + "   inside" : nN + "   " + str.tostring(nD, "#.##") + "%"
-zoneCol = na(nD) ? color.gray : cTblTx
-fibTxt  = na(fib50) ? "n/a" : str.tostring(fib50, format.mintick) + "   " + (close > fib50 ? "above" : "below")
-evTxt   = na(lastEvB) ? "None yet" : str.tostring(bar_index - lastEvB) + " bars ago"
-
-var table tb = table.new(tblPos, 2, 7, bgcolor = cTblBg,
+var table tb = table.new(tblPos, 2, 8, bgcolor = cTblBg,
      border_color = color.new(color.gray, 60), border_width = 1,
      frame_color = color.new(color.gray, 50), frame_width = 1)
 
+// All table math runs on the last bar only, nothing else reads it.
 if showTable and barstate.islast
+    // nearest live zone (used for the "Active zone" row), hidden ones included
+    float  nD = na
+    string nN = "None"
+    bool   nH = false
+    if not na(bBox1)
+        d = zDist(bTop1, bBot1)
+        if na(nD) or d < nD
+            nD := d
+            nN := bBrk1 ? "Bear Breaker" : "Bull OB"
+            nH := bFar1
+    if not na(bBox2)
+        d = zDist(bTop2, bBot2)
+        if na(nD) or d < nD
+            nD := d
+            nN := bBrk2 ? "Bear Breaker" : "Bull OB"
+            nH := bFar2
+    if not na(sBox1)
+        d = zDist(sTop1, sBot1)
+        if na(nD) or d < nD
+            nD := d
+            nN := sBrk1 ? "Bull Breaker" : "Bear OB"
+            nH := sFar1
+    if not na(sBox2)
+        d = zDist(sTop2, sBot2)
+        if na(nD) or d < nD
+            nD := d
+            nN := sBrk2 ? "Bull Breaker" : "Bear OB"
+            nH := sFar2
+
+    // shown zones by effective direction (a breaker counts for the side it now
+    // acts for), plus how many are parked out of range
+    nBull = (not na(bBox1) and not bFar1 and not bBrk1 ? 1 : 0) + (not na(bBox2) and not bFar2 and not bBrk2 ? 1 : 0) +
+         (not na(sBox1) and not sFar1 and sBrk1 ? 1 : 0) + (not na(sBox2) and not sFar2 and sBrk2 ? 1 : 0)
+    nBear = (not na(sBox1) and not sFar1 and not sBrk1 ? 1 : 0) + (not na(sBox2) and not sFar2 and not sBrk2 ? 1 : 0) +
+         (not na(bBox1) and not bFar1 and bBrk1 ? 1 : 0) + (not na(bBox2) and not bFar2 and bBrk2 ? 1 : 0)
+    nHid  = (not na(bBox1) and bFar1 ? 1 : 0) + (not na(bBox2) and bFar2 ? 1 : 0) +
+         (not na(sBox1) and sFar1 ? 1 : 0) + (not na(sBox2) and sFar2 ? 1 : 0)
+    cntTxt = str.tostring(nBull) + " / " + str.tostring(nBear) + (nHid > 0 ? "   +" + str.tostring(nHid) + " hidden" : "")
+
+    armUp = gateUp and (not ltfAlign or bias ==  1)
+    armDn = gateDn and (not ltfAlign or bias == -1)
+
+    biasTxt = bias == 1 ? "Bullish" : bias == -1 ? "Bearish" : "Neutral"
+    biasCol = bias == 1 ? cUp : bias == -1 ? cDn : color.gray
+    sfpTxt  = na(sfpBar) ? "None" : (sfpDir == 1 ? "Bullish" : "Bearish") + "  " + str.tostring(bar_index - sfpBar) + " bars ago"
+    sfpCol  = na(sfpBar) ? color.gray : (sfpDir == 1 ? cUp : cDn)
+    zoneTxt = na(nD) ? "None" : nD <= 0.0 ? nN + "   inside" : nN + "   " + str.tostring(nD, "#.##") + "%" + (nH ? "  (hidden)" : "")
+    zoneCol = na(nD) or nH ? color.gray : cTblTx
+    fibTxt  = na(fib50) ? "n/a" : str.tostring(fib50, format.mintick) + "   " + (close > fib50 ? "above" : "below")
+    evTxt   = na(lastEvB) ? "None yet" : str.tostring(bar_index - lastEvB) + " bars ago"
+    gateTxt = mssGate == "None" ? "Off" : armUp and armDn ? "Both armed" : armUp ? "Long armed" : armDn ? "Short armed" : "Waiting"
+    gateCol = mssGate == "None" ? color.gray : armUp and not armDn ? cUp : armDn and not armUp ? cDn : cTblTx
+
     table.cell(tb, 0, 0, "Roman Trade Setup", text_color = cTblTx, text_size = tblSize, text_halign = text.align_left,  bgcolor = color.new(color.gray, 75))
     table.cell(tb, 1, 0, htfTf + " -> " + timeframe.period, text_color = cTblTx, text_size = tblSize, text_halign = text.align_right, bgcolor = color.new(color.gray, 75))
     table.cell(tb, 0, 1, "Bias",          text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
@@ -450,16 +618,22 @@ if showTable and barstate.islast
     table.cell(tb, 1, 3, zoneTxt,         text_color = zoneCol, text_size = tblSize, text_halign = text.align_right)
     table.cell(tb, 0, 4, "50% Fib",       text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
     table.cell(tb, 1, 4, fibTxt,          text_color = cFib, text_size = tblSize, text_halign = text.align_right)
-    table.cell(tb, 0, 5, "Zones B / S",   text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
-    table.cell(tb, 1, 5, str.tostring(nBull) + " / " + str.tostring(nBear), text_color = cTblTx, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 5, "Zones Bull / Bear", text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 5, cntTxt, text_color = cTblTx, text_size = tblSize, text_halign = text.align_right)
     table.cell(tb, 0, 6, "Last HTF MSS",  text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
     table.cell(tb, 1, 6, evTxt,           text_color = cTblTx, text_size = tblSize, text_halign = text.align_right)
+    table.cell(tb, 0, 7, "MSS filter",    text_color = cTblTx, text_size = tblSize, text_halign = text.align_left)
+    table.cell(tb, 1, 7, gateTxt,         text_color = gateCol, text_size = tblSize, text_halign = text.align_right)
 
 // ============================= ALERTS ========================================
-// Create alerts with "Once Per Bar Close" for consistent behaviour.
-alertcondition(evBull,  "HTF bias -> Bullish", "HTF MSS up: bias is now bullish")
-alertcondition(evBear,  "HTF bias -> Bearish", "HTF MSS down: bias is now bearish")
-alertcondition(sfpBull, "HTF Bullish SFP",     "Bias-aligned bullish SFP on HTF")
-alertcondition(sfpBear, "HTF Bearish SFP",     "Bias-aligned bearish SFP on HTF")
-alertcondition(mssUp,   "H1 MSS up",           "H1 MSS up, aligned with HTF bias")
-alertcondition(mssDn,   "H1 MSS down",         "H1 MSS down, aligned with HTF bias")
+// With "Act only on CLOSED HTF bars" on (default), the four HTF events are final
+// from the first tick of the chart bar, so "Once Per Bar" fires them right at
+// the HTF close and "Once Per Bar Close" just adds one chart bar of delay.
+// In live (unconfirmed) HTF mode use "Once Per Bar Close" for everything.
+// The LTF MSS conditions only turn true on a closed bar, either setting works.
+alertcondition(evBull,  "HTF bias -> Bullish", "{{ticker}}: HTF MSS up, bias is now bullish")
+alertcondition(evBear,  "HTF bias -> Bearish", "{{ticker}}: HTF MSS down, bias is now bearish")
+alertcondition(sfpBull, "HTF Bullish SFP",     "{{ticker}}: bias-aligned bullish SFP on HTF")
+alertcondition(sfpBear, "HTF Bearish SFP",     "{{ticker}}: bias-aligned bearish SFP on HTF")
+alertcondition(mssUp,   "LTF MSS up",          "{{ticker}} {{interval}}: MSS up (passed bias and setup filters)")
+alertcondition(mssDn,   "LTF MSS down",        "{{ticker}} {{interval}}: MSS down (passed bias and setup filters)")
